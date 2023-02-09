@@ -1,0 +1,186 @@
+---
+title: "RPKM by Developmental Stage - Mouse"
+author: "Martyn Frith"
+date: "9 February 2023"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning=FALSE, message=FALSE, fig.align = "center")
+```
+###User inputs
+Here the user defines the variables needed to run the script:
+```{r}
+rawData <- ("Setd1a-Het-WT_E14-P70_AllGenes_rpkm.txt") 
+metaData <- ("sample_meta.csv")
+desiredGenes <- c("Trio", "Grin2a", "Setd1a")
+  desiredGenes <- sort(desiredGenes)
+Log2TransRPKM <- TRUE
+```
+* `RawData`: user gives the path to the file that contains their raw RPKM data.
+* `metaData`: user gives the path to the file that contains their meta data.
+* `desiredGenes`: user gives the gene symbols for the genes they wish to plot.
+  *`desiredGenes` is sorted alphabetically. This is important to keep values matched to the correct gene ID in subsequent steps
+* `Log2TransRPKM`: does the user want to log2 transform RPKM data? User gives `TRUE` or `FALSE`.
+
+###Loading packages
+In this section of code, the packages needed to run the script are loaded.
+There are two `select` functions being loaded here, one from `dplyr` and one from `biomaRt`. The `select <- dplyr::select` line is used to define `select` in this script as the `select` function loaded in the `dplyr` package.
+
+```{r}
+library(tidyverse)
+library(reshape2) 
+library(plotrix)
+library(biomaRt)
+select <- dplyr::select 
+```
+  
+* `tidyverse` includes key packages such as `dplyr` and `ggplot2` for data manipulation and plot creation respectively. 
+* `reshape` includes the `melt` function that will be used later in the script.
+* `plotrix` includes the `std.error` function that will be used later in the script.
+* `biomaRt` allows the script to access biomaRt.
+
+###Loading Datasets
+The raw and meta data sets that have been defined by the user are loaded here. The first column of the data set is renamed to reflect the contents of the column. `Raw$ensembl_ID <- gsub("\\..*", "", Raw$ensembl_ID)` causes all characters after the '.' to be removed from the string for each value in string in the `ensembl_ID` column of `Raw`.
+```{r}
+Meta <- read_csv(metaData)   
+
+Raw <- read_tsv(rawData) %>%   
+  rename("ensembl_ID" = "...1")
+Raw$ensembl_ID <- gsub("\\..*", "", Raw$ensembl_ID)
+```
+```{r, echo=FALSE}
+hRaw <- head(Raw[,1:11])
+knitr::kable(hRaw)
+```
+###Biomart Query
+Here the script uses the `biomaRt` package to select the enesmbl biomart and the Mus Musculus genome assembly from within ensembl. The `getBM` function is used to construct a biomart query where the ensembl gene IDs and the external gene names from the Mus Musculus genome assembly are fetched and then filtered based on whether the fetched ensemble gene ID is also found in the `ensembl_ID` column of `Raw`. The output of the query is saved to `genemap`.
+
+Matches between ensembl IDs found in `genemap` and in `Raw` are saved to `idx`. A column named `gene_symbol`, which contains the matches in the `external_gene_name` column of `genemap` indexed by `idx`, is appended to `Raw`. This column contains the corresponding gene symbol each ensembl ID in the original raw data set.
+```{r}
+ensembl = useEnsembl(biomart =  "ensembl", dataset = "mmusculus_gene_ensembl")
+genemap <- getBM(attributes = c("ensembl_gene_id", "external_gene_name"), 
+                  filters = "ensembl_gene_id",
+                  values = Raw$ensembl_ID,
+                  mart = ensembl)
+
+idx <- match(Raw$ensembl_ID, genemap$ensembl_gene_id)
+Raw$gene_symbol <- genemap$external_gene_name[ idx ]
+```
+###Data Manipulation
+In these sections of code the data that is contained within `Raw` and `Meta` are manipulated into one table.
+
+  * `RawFiltered`:  
+    * Rows with `gene_symbol` values that do not match the values stored in `desiredGenes` are filtered out of `Raw`. 
+    * The remaining rows arranged by `gene_symbol` in alphabetical order for clarity when checking the variable. 
+    * The data in `RawFiltered` is arranged vertically so that it can be joined to `Meta`.
+  * `Joined`: 
+    * A left join is used to keep all the columns in `Meta` and add only the desired gene columns from `Raw`.
+    * Mutate is used ensure that all the columns that contain the desired gene data are classed as numeric
+    * Finally the `ordered` function is used to ensure that the data in age are classed as factors and have the correct levels
+``` {r}
+RawFiltered <- Raw %>%
+  filter(gene_symbol %in% desiredGenes, .preserve = TRUE) %>%
+  arrange(gene_symbol)
+
+RawFiltered <- data.frame(t(RawFiltered[-1]))  
+colnames(RawFiltered) <- desiredGenes   
+RawFiltered <- rownames_to_column(RawFiltered, "Sample_ID")
+
+Joined <- Meta %>%
+  left_join(RawFiltered, by = c("sampleID" = "Sample_ID")) %>% 
+  mutate(across(desiredGenes, as.numeric))
+Joined$age <- ordered(Joined$age, levels = c("E14", "E18", "P7", "P35", "P70"))
+```
+```{r, echo=FALSE}
+hJoined <- Joined %>%
+  select(sampleID, age, genotype, age_days, Trio, Grin2a, Setd1a)
+hhJoined <- head(hJoined)
+knitr::kable(hhJoined)
+```
+###Data summary
+In these sections of code the means and standard errors at each developmental stage for each gene are calculated and joined together to form a table from which data for creating RPKM by developmental stage plots can be pulled.
+
+  * For each of `Means` and `StdError`:
+    + The user can choose to filter the `Joined` data by any condition/s within the `Joined` data frame.
+    + The age column and all the columns that match the values in the `desiredGenes` vector are selected.
+    + The selected columns are grouped by age.
+    + The mean/standard error of each age group in each column is calculated.
+    + `melt` is used to make the data vertical.
+  * `PlotData`:
+    + The `Means` and `StdError` data frames are joined using a left_join to form a new table called `PlotData`.
+    + Mutate is used to create new columns for the minimum and maximum standard error values and for each of the log2 transformed RPKM, standard error, and minimum and maximum standard error values.
+```{r}
+Means <- Joined %>%
+  filter(genotype == "WT") %>%  
+  select((desiredGenes), age) %>%
+  group_by(age) %>%
+  summarise_each(funs(mean)) %>% 
+  melt(id.vars = "age", variable.name = "gene_symbol", value.name = "RPKM") 
+
+StdError <- Joined %>%
+  filter(genotype == "WT") %>%
+  select((desiredGenes), age) %>%
+  group_by(age) %>%
+  summarise_each(funs(std.error)) %>%  
+  melt(id.vars = "age", variable.name = "gene_symbol", value.name = "se") 
+
+PlotData <- left_join(Means, StdError) %>%
+  mutate(se_min = RPKM - (se/2),
+         se_max = RPKM + (se/2),
+         RPKM_log2 = log2(RPKM +1),
+         se_log2 = log2(se +1),
+         se_min_log2 = RPKM_log2 - (se_log2/2),
+         se_max_log2 = RPKM_log2 + (se_log2/2))
+```
+```{r, echo=FALSE}
+hPData <- head(PlotData)
+knitr::kable(hPData)
+```
+###Plotting the data
+There are two chunks of code here that are used to generate RPKM by developmental stage plots. They are separated using a simple if/else statement, where if the user indicates they would like the data used in the plot to be log2 transformed by specifying that `LogTransRPKM` is `TRUE` (in the user input chunk) then the first code chunk will be used to produce the plot, else the second code chunk will be used to produce the plot. 
+
+The layers used in each plot are largely the same:
+
+  * `ggplot`: both pull data from the `PlotData` data frame. In `aes()` layer both use age for the x-axis, and both group and colour by gene symbol. In the first code chunk the log2 transformed RPKM is used for the y-axis, whereas in the second chunk the RPKM is used.
+  * `geom_line`: used to create a line plot of the data specified in the `ggplot(aes())` layer .
+  * `geom_ribbon`: used to create the standard error ribbon. `aes()` layer is the same as in `ggplot()` except the minimum and maximum y-axis values need to be specified. Log2 transformed values are used in the first chunk and not in the second.
+  * `scale_x_discrete`: used to specify that the x-axis is using discrete data as well as the labels for each x-axis tick mark.
+  * `labs`: used to specify the x and y-axis labels and the title.
+  * `theme`: used to specify the colours and other properties of various visual elements of the plot.
+```{r  echo=TRUE}
+breakLabs <- c(0, 0.00098, 0.00195, 0.00390, 0.00781, 0.01563, 0.03125, 0.0625, 0.125, 0.25, 0.5, 1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096)
+
+if (Log2TransRPKM == TRUE) {
+  
+  geneExprPlotLog2 <- ggplot(PlotData, aes(x = age, y=RPKM_log2, color = gene_symbol, group = gene_symbol)) + 
+    geom_line(linewidth = 1.1) +
+    geom_ribbon(aes(x=age, ymax = se_min_log2, ymin = se_max_log2, color = gene_symbol, 
+                    fill = gene_symbol), alpha = 0.25) +
+    scale_x_discrete(labels = c("E14", "E18", "P7", "P35", "P70")) +
+    labs(x="Developmental Stage", y="log2(RPKM + 1)", title = "log2(RPKM + 1) by Developmental Stage" ) +
+    theme(axis.text.x = element_text(vjust = 1, hjust=1, angle = 45),
+          panel.background = element_rect(fill = "white"),
+          panel.grid.major = element_line(color = "grey 95"),
+          panel.grid.minor.y = element_line(color = "grey 96"),
+          axis.line = element_line((color = "light grey")))
+  print(geneExprPlotLog2)
+  
+}else{
+
+  geneExprPlot <- ggplot(PlotData, aes(x = age, y=RPKM, color = gene_symbol, group = gene_symbol)) + 
+    geom_line(linewidth = 1.1) +
+    geom_ribbon(aes(x=age, ymin= se_min, ymax = se_max, color = gene_symbol, fill = gene_symbol), alpha = 0.25) +
+    scale_y_continuous(trans = "log2", breaks = breakLabs) + 
+    coord_cartesian(ylim = c(min(PlotData$se_min), max(PlotData$se_max))) + 
+    scale_x_discrete(labels = c("E14", "E18", "P7", "P35", "P70")) +
+    labs(x="Developmental Stage", y="RPKM", title = "RPKM by Developmental Stage" ) +
+    theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1), 
+          panel.background = element_rect(fill = "white"), 
+          panel.grid.major = element_line(color = "grey 95"),
+          panel.grid.minor.y = element_line(color = "grey 96"),
+          axis.line = element_line(color = "light grey"),
+          axis.title.x = element_blank())
+  print(geneExprPlot)
+}
+```
